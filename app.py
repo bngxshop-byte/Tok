@@ -1,21 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-MajorLogin Flask API - Single File (with ~ -> # auto-replace)
-
-Usage:
-    pip install flask httpx pycryptodome google-play-scraper protobuf
-    python app.py
-
-URL format:
-    Instead of # use ~ in password (because # breaks URLs)
-    http://127.0.0.1:5000/login?uid=8007695996&password=BNGX_LVL~3HFO19
-    Server will auto-convert ~ to # before sending to Garena.
-
-Endpoints:
-    GET  /                              -> info
-    GET  /health                        -> health check
-    GET  /login?uid=XXX&password=YYY    -> main (use ~ for #)
-    POST /login                         -> JSON/form (no conversion, raw password)
+MajorLogin API - Vercel Serverless
 """
 import asyncio
 import os
@@ -27,13 +12,14 @@ from google_play_scraper import app as play_scraper
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
-import thunderFF_pb2  # <-- must be in same folder
+# استيراد pb2 من المجلد الأب
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import thunderFF_pb2
 
 # ==================== CONFIG ====================
 AES_KEY = b'Yg&tc%DEuh6%Zc^8'
 AES_IV = b'6oyZDr22E3ychjM%'
-
-# Set to False if you ever need literal '~' in passwords (then use POST)
 AUTO_REPLACE_TILDE_WITH_HASH = True
 
 _HEADERS = {
@@ -48,6 +34,7 @@ _HEADERS = {
     'ReleaseVersion': 'OB55'
 }
 
+app = Flask(__name__)
 _VERSION_CACHE = None
 
 
@@ -85,7 +72,6 @@ def _pb_field(f, v):
     return b""
 
 
-# ==================== AES ====================
 def aes_encrypt(payload, key, iv):
     cipher = AES.new(key, AES.MODE_CBC, iv)
     return cipher.encrypt(pad(payload, AES.block_size))
@@ -100,11 +86,10 @@ def _get_playstore_version():
         return "1.132.8"
 
 
-async def version_config(client: httpx.AsyncClient):
+async def version_config(client):
     global _VERSION_CACHE
     if _VERSION_CACHE:
         return _VERSION_CACHE
-
     try:
         loop = asyncio.get_event_loop()
         app_version = await loop.run_in_executor(None, _get_playstore_version) or "1.132.8"
@@ -130,7 +115,7 @@ async def version_config(client: httpx.AsyncClient):
 
 
 # ==================== OAUTH ====================
-async def get_access_token(client: httpx.AsyncClient, uid: str, password: str):
+async def get_access_token(client, uid, password):
     url = "https://100067.connect.garena.com/oauth/guest/token/grant"
     hdrs = {
         "Host": "100067.connect.garena.com",
@@ -166,7 +151,7 @@ async def get_access_token(client: httpx.AsyncClient, uid: str, password: str):
     return None
 
 
-# ==================== MAJORLOGIN PAYLOAD ====================
+# ==================== PAYLOAD ====================
 def build_majorlogin_payload_uid(open_id, access_token, platform, client_version):
     try:
         proto = thunderFF_pb2.MajorLoginReq()
@@ -250,22 +235,18 @@ def build_majorlogin_payload_uid(open_id, access_token, platform, client_version
         return None
 
 
-# ==================== SEND MAJORLOGIN ====================
-async def send_majorlogin(client: httpx.AsyncClient, data, release_version, server_url):
+# ==================== SEND ====================
+async def send_majorlogin(client, data, release_version, server_url):
     try:
         url = f"{server_url}MajorLogin" if server_url.endswith('/') else f"{server_url}/MajorLogin"
         req_headers = _HEADERS.copy()
         req_headers["ReleaseVersion"] = release_version
         response = await client.post(url, headers=req_headers, data=data)
-
         if response.status_code != 200:
             print(f"[-] MajorLogin HTTP {response.status_code}")
-            print(f"    Body: {response.content[:200]}")
             return None
-
         response_content = response.content
         if len(response_content) < 40:
-            print(f"[-] MajorLogin response too short: {len(response_content)} bytes")
             return None
 
         try:
@@ -300,9 +281,9 @@ async def send_majorlogin(client: httpx.AsyncClient, data, release_version, serv
         return None
 
 
-# ==================== MAIN EXTRACT ====================
-async def extract_majorlogin(uid: str, password: str) -> dict:
-    async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+# ==================== MAIN ====================
+async def extract_majorlogin(uid, password):
+    async with httpx.AsyncClient(verify=False, timeout=12.0) as client:
         ver = await version_config(client)
         if not ver:
             return {"ok": False, "error": "version_config_failed"}
@@ -340,44 +321,53 @@ async def extract_majorlogin(uid: str, password: str) -> dict:
         }
 
 
-# ==================== FLASK APP ====================
-app = Flask(__name__)
-app.config["JSON_AS_ASCII"] = False
+def _run_async(coro):
+    """Vercel-safe async runner."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("loop closed")
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
 
-_LOOP = asyncio.new_event_loop()
-asyncio.set_event_loop(_LOOP)
 
-
-def run_async(coro):
-    return _LOOP.run_until_complete(coro)
-
-
-def _normalize_password(password: str) -> str:
-    """
-    Convert ~ back to # for GET requests.
-    This lets URLs carry passwords containing '#' safely.
-    """
+def _normalize_password(password):
     if AUTO_REPLACE_TILDE_WITH_HASH and password:
         return password.replace("~", "#")
     return password
 
 
+def _do_login(uid, password):
+    if not uid or not password:
+        return jsonify({"ok": False, "error": "missing_credentials",
+                        "hint": "Provide 'uid' and 'password'."}), 400
+    if not uid.isdigit():
+        return jsonify({"ok": False, "error": "invalid_uid",
+                        "hint": "UID must be digits only."}), 400
+    try:
+        result = _run_async(extract_majorlogin(uid, password))
+    except Exception as e:
+        return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
+
+    if not result.get("ok"):
+        err = result.get("error", "unknown")
+        code = 401 if err in ("oauth_failed", "majorlogin_failed") else 502
+        return jsonify(result), code
+    return jsonify(result), 200
+
+
+# ==================== ROUTES ====================
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
         "service": "MajorLogin API",
-        "version": "1.1",
-        "note": "In GET requests, use '~' instead of '#' in password. Server converts it back.",
+        "note": "In GET, use '~' instead of '#' in password.",
         "endpoints": {
-            "GET /login?uid=XXX&password=YYY": {
-                "example": "http://127.0.0.1:5000/login?uid=8007695996&password=BNGX_LVL~3HFO19",
-                "note": "~ is converted to # automatically"
-            },
-            "POST /login": {
-                "body": {"uid": "string", "password": "string"},
-                "note": "No conversion — send raw password"
-            },
-            "GET /health": "Health check"
+            "GET /login?uid=XXX&password=YYY": "~ -> # auto-convert",
+            "POST /login": {"body": {"uid": "...", "password": "..."}},
+            "GET /health": "health check"
         }
     })
 
@@ -387,35 +377,6 @@ def health():
     return jsonify({"ok": True, "status": "alive"})
 
 
-def _do_login(uid: str, password: str):
-    if not uid or not password:
-        return jsonify({
-            "ok": False,
-            "error": "missing_credentials",
-            "hint": "Provide 'uid' and 'password'."
-        }), 400
-
-    if not uid.isdigit():
-        return jsonify({
-            "ok": False,
-            "error": "invalid_uid",
-            "hint": "UID must be digits only."
-        }), 400
-
-    try:
-        result = run_async(extract_majorlogin(uid, password))
-    except Exception as e:
-        return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
-
-    if not result.get("ok"):
-        err = result.get("error", "unknown")
-        code = 401 if err in ("oauth_failed", "majorlogin_failed") else 502
-        return jsonify(result), code
-
-    return jsonify(result), 200
-
-
-# ---------- POST (JSON / form-data) — no conversion ----------
 @app.route("/login", methods=["POST"])
 def login_post():
     if request.is_json:
@@ -425,20 +386,14 @@ def login_post():
     else:
         uid = str(request.form.get("uid", "")).strip()
         password = str(request.form.get("password", "")).strip()
-
-    # POST: use raw password (user can send '#' directly in JSON)
     return _do_login(uid, password)
 
 
-# ---------- GET (query params) — converts ~ to # ----------
 @app.route("/login", methods=["GET"])
 def login_get():
     uid = str(request.args.get("uid", "")).strip()
     raw_password = str(request.args.get("password", "")).strip()
-
-    # Convert ~ -> # for GET requests
     password = _normalize_password(raw_password)
-
     return _do_login(uid, password)
 
 
@@ -447,27 +402,11 @@ def not_found(e):
     return jsonify({"ok": False, "error": "not_found"}), 404
 
 
-@app.errorhandler(405)
-def method_not_allowed(e):
-    return jsonify({"ok": False, "error": "method_not_allowed"}), 405
-
-
 @app.errorhandler(500)
 def server_error(e):
     return jsonify({"ok": False, "error": "internal_error"}), 500
 
 
-# ==================== RUN ====================
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    print("=" * 60)
-    print("   MajorLogin Flask API")
-    print("=" * 60)
-    print(f"[i] Listening    : http://0.0.0.0:{port}")
-    print(f"[i] Health       : http://localhost:{port}/health")
-    print(f"[i] POST login   : http://localhost:{port}/login")
-    print(f"[i] GET  login   : http://localhost:{port}/login?uid=XXX&password=YYY")
-    print(f"[i] NOTE         : In GET, use ~ instead of # in password")
-    print(f"[i] Example      : http://127.0.0.1:5000/login?uid=8007695996&password=BNGX_LVL~3HFO19")
-    print("=" * 60)
-    app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
+# Vercel entrypoint — used by serverless
+def handler(event, context):
+    return app
